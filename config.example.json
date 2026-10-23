@@ -1,0 +1,16 @@
+{
+  "project": "defectdojo",
+  "version": "3.4.202",
+  "port": 8080,
+  "site_url": "http://localhost:8080",
+  "allowed_hosts": ["localhost", "127.0.0.1"],
+  "https": false,
+  "backup_dir": "backups",
+  "backup_copy_dir": null,
+  "retention_days": 14,
+  "command_timeout": 300,
+  "migration_timeout": 1800,
+  "drain_timeout": 900,
+  "health_timeout": 180,
+  "notification_hook": null
+}

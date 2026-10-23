@@ -1,0 +1,15 @@
+[Unit]
+Description=Check DefectDojo releases without applying upgrades
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=defectdojo-ops
+Group=defectdojo-ops
+WorkingDirectory=/opt/defectdojo-update-manager
+ExecStart=/opt/defectdojo-update-manager/dojo check-update
+UMask=0077
+TimeoutStartSec=2m
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily DefectDojo backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=defectdojo-backup.service
+
+[Install]
+WantedBy=timers.target

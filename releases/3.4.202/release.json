@@ -1,0 +1,20 @@
+{
+  "version": "3.4.202",
+  "commit": "8cbbe0d8c82d007662d270ccd7ab3365e2c84a83",
+  "source": "https://github.com/DefectDojo/django-DefectDojo/tree/8cbbe0d8c82d007662d270ccd7ab3365e2c84a83",
+  "release_notes": "https://github.com/DefectDojo/django-DefectDojo/releases/tag/3.4.202",
+  "files": {
+    "docker-compose.yml": "c1e5c171b34c249bc08742caecca099b8b1f5a61b3367c422dd42fdc3ddfa13c",
+    "LICENSE.md": "7e6db954594a85fd09d22f9808b30f3701ce67129c1be949a25f9bb1b07cb780",
+    "compose.json": "718b32b33d93e3cc7f6973359be5117ba69e323e11748da9cb3b67a2e49b359d"
+  },
+  "images": {
+    "celerybeat": "docker.io/defectdojo/defectdojo-django:3.4.202@sha256:b1c3fc5c295f1f22b78f34f1f1becf3e6e5b2f31e9072cd5a8c58e3a77c48fa3",
+    "celeryworker": "docker.io/defectdojo/defectdojo-django:3.4.202@sha256:b1c3fc5c295f1f22b78f34f1f1becf3e6e5b2f31e9072cd5a8c58e3a77c48fa3",
+    "initializer": "docker.io/defectdojo/defectdojo-django:3.4.202@sha256:b1c3fc5c295f1f22b78f34f1f1becf3e6e5b2f31e9072cd5a8c58e3a77c48fa3",
+    "nginx": "docker.io/defectdojo/defectdojo-nginx:3.4.202@sha256:3bca07c2050f5c3d8413055cbc4550b83319a49ee7fd68b82e7f33498459e21d",
+    "postgres": "postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+    "uwsgi": "docker.io/defectdojo/defectdojo-django:3.4.202@sha256:b1c3fc5c295f1f22b78f34f1f1becf3e6e5b2f31e9072cd5a8c58e3a77c48fa3",
+    "valkey": "valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11"
+  }
+}

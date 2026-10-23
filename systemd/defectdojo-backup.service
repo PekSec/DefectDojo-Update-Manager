@@ -1,0 +1,19 @@
+[Unit]
+Description=DefectDojo verified daily backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=defectdojo-ops
+Group=defectdojo-ops
+SupplementaryGroups=docker
+WorkingDirectory=/opt/defectdojo-update-manager
+ExecStart=/opt/defectdojo-update-manager/dojo backup
+UMask=0077
+# Do not interrupt a drain, backup, or initializer with systemd's default deadline.
+TimeoutStartSec=4h
+TimeoutStopSec=60
+Nice=10
+StandardOutput=journal
+StandardError=journal

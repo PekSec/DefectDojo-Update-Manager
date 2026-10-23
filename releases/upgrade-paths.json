@@ -1,0 +1,18 @@
+{
+  "paths": [
+    {
+      "from": "3.4.201",
+      "to": "3.4.202",
+      "from_commit": "1b10e779eeeb624d75eb328f58fa8424ec09d000",
+      "to_commit": "8cbbe0d8c82d007662d270ccd7ab3365e2c84a83",
+      "tested": true,
+      "notes": [
+        "https://docs.defectdojo.com/releases/os_upgrading/3.4/",
+        "https://docs.defectdojo.com/releases/os_upgrading/3.4.200/",
+        "https://github.com/DefectDojo/django-DefectDojo/releases/tag/3.4.201",
+        "https://github.com/DefectDojo/django-DefectDojo/releases/tag/3.4.202"
+      ],
+      "evidence": "docs/validation.md: isolated real Docker lifecycle passed on 2026-10-23; tests/test_integration.py"
+    }
+  ]
+}

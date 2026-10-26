@@ -28,6 +28,9 @@ class DockerLifecycle(unittest.TestCase):
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]
             config.update(project=project, port=port, site_url=f'http://localhost:{port}', version='3.4.201')
+            # Tiny fixture data; production headroom must be measured separately.
+            config.update(disk_reserve_gib=1, backup_estimate_gib=1, restore_estimate_gib=1)
+            config['image_storage_dir'] = os.environ.get('DDM_IMAGE_STORAGE_DIR')
             dm.write_json(m.state / 'config.json', config)
             m.load()
             with m.lock():

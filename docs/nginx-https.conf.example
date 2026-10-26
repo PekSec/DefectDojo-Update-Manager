@@ -5,7 +5,9 @@ server {
     ssl_certificate /etc/ssl/defectdojo/fullchain.pem;
     ssl_certificate_key /etc/ssl/defectdojo/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    client_max_body_size 100m;
+    # Match config.json upload_max_mb / upload_timeout (production example).
+    client_max_body_size 800m;
+    client_body_timeout 300s;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -13,7 +15,8 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_read_timeout 900s;
-        proxy_send_timeout 900s;
+        # Match config.json request_timeout. Idle I/O timeouts, not an import kill timer.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }

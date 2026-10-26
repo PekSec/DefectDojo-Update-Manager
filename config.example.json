@@ -3,7 +3,10 @@
   "version": "3.4.202",
   "port": 8080,
   "site_url": "http://localhost:8080",
-  "allowed_hosts": ["localhost", "127.0.0.1"],
+  "allowed_hosts": [
+    "localhost",
+    "127.0.0.1"
+  ],
   "https": false,
   "backup_dir": "backups",
   "backup_copy_dir": null,
@@ -12,5 +15,23 @@
   "migration_timeout": 1800,
   "drain_timeout": 900,
   "health_timeout": 180,
-  "notification_hook": null
+  "notification_hook": null,
+  "profile": "pilot",
+  "worker_concurrency": 2,
+  "uwsgi_processes": 4,
+  "uwsgi_threads": 4,
+  "postgres_settings": {},
+  "resource_limits_gib": {},
+  "upload_max_mb": 800,
+  "request_timeout": 1800,
+  "upload_timeout": 60,
+  "data_upload_max_memory_mb": 8,
+  "backup_timeout": 7200,
+  "restore_timeout": 14400,
+  "data_mount": null,
+  "image_storage_dir": null,
+  "backup_copy_mount": null,
+  "disk_reserve_gib": 5,
+  "backup_estimate_gib": 10,
+  "restore_estimate_gib": 20
 }

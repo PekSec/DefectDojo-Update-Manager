@@ -24,6 +24,20 @@ ROOT = Path(__file__).resolve().parent
 SERVICES = {'nginx', 'uwsgi', 'initializer', 'celeryworker', 'celerybeat', 'postgres', 'valkey'}
 WRITERS = ['nginx', 'uwsgi', 'celerybeat', 'celeryworker']
 DEFAULT_VERSION = '3.4.202'
+GIB = 1024**3
+# Only newly introduced keys are optional; missing original keys still indicate damage.
+OPTIONAL_DEFAULTS = {
+    'profile': 'pilot', 'worker_concurrency': 2, 'uwsgi_processes': 4, 'uwsgi_threads': 4,
+    'postgres_settings': {}, 'resource_limits_gib': {},
+    'upload_max_mb': 800, 'request_timeout': 1800, 'upload_timeout': 60,
+    'data_upload_max_memory_mb': 8, 'backup_timeout': 7200, 'restore_timeout': 14400,
+    'data_mount': None, 'image_storage_dir': None, 'backup_copy_mount': None,
+    'disk_reserve_gib': 5, 'backup_estimate_gib': 10, 'restore_estimate_gib': 20,
+}
+PG_MEMORY = {'shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem',
+             'autovacuum_work_mem', 'max_wal_size', 'min_wal_size'}
+PG_COUNTS = {'max_connections', 'max_parallel_workers_per_gather', 'max_parallel_workers',
+             'max_parallel_maintenance_workers', 'max_worker_processes', 'autovacuum_max_workers'}
 
 
 class Failure(Exception):
@@ -206,8 +220,41 @@ class Manager:
 
     def validate_config(self, config, credentials):
         defaults = read_json(self.root / 'config.example.json')
-        if set(config) != set(defaults):
+        if set(config) - (set(defaults) | set(OPTIONAL_DEFAULTS)) or (set(defaults) - set(OPTIONAL_DEFAULTS)) - set(config):
             raise Failure('Configuration keys must match config.example.json')
+        for key, value in OPTIONAL_DEFAULTS.items():
+            config.setdefault(key, value.copy() if isinstance(value, dict) else value)
+        if config['profile'] not in ('pilot', 'single-vm-production'):
+            raise Failure('Invalid profile')
+        bounds = {'worker_concurrency': 32, 'uwsgi_processes': 16, 'uwsgi_threads': 16,
+                  'upload_max_mb': 4096, 'data_upload_max_memory_mb': 1024,
+                  'request_timeout': 86400, 'upload_timeout': 86400,
+                  'backup_timeout': 604800, 'restore_timeout': 604800,
+                  'disk_reserve_gib': 1048576, 'backup_estimate_gib': 1048576,
+                  'restore_estimate_gib': 1048576}
+        for key, maximum in bounds.items():
+            if type(config[key]) is not int or not 1 <= config[key] <= maximum:
+                raise Failure(f'{key} must be an integer from 1 to {maximum}')
+        pg = config['postgres_settings']
+        if not isinstance(pg, dict) or set(pg) - (PG_MEMORY | PG_COUNTS):
+            raise Failure('Unsupported PostgreSQL setting')
+        for key, value in pg.items():
+            if key in PG_MEMORY:
+                valid = isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*(MB|GB)', value)
+            else:
+                valid = type(value) is int and 0 <= value <= 1000 and (value > 0 or key.startswith('max_parallel'))
+            if not valid:
+                raise Failure(f'Invalid PostgreSQL setting: {key}')
+        limits = config['resource_limits_gib']
+        if not isinstance(limits, dict) or set(limits) - SERVICES or any(type(v) is not int or not 1 <= v <= 64 for v in limits.values()):
+            raise Failure('resource_limits_gib must map service names to integer GiB limits (1..64)')
+        if config['profile'] == 'single-vm-production' and (set(limits) != SERVICES or sum(limits.values()) > 52):
+            raise Failure('Production memory budget requires all service limits totaling at most 52 GiB; retain host/cache headroom')
+        for key in ('data_mount', 'image_storage_dir', 'backup_copy_mount'):
+            if config[key] is not None and (not isinstance(config[key], str) or not Path(config[key]).is_absolute() or ',' in config[key]):
+                raise Failure(f'{key} must be an absolute path')
+        if config['profile'] == 'single-vm-production' and not all(config[k] for k in ('data_mount', 'backup_copy_dir', 'backup_copy_mount')):
+            raise Failure('Production requires data_mount, backup_copy_dir and backup_copy_mount')
         if not re.fullmatch(r'[a-z][a-z0-9_-]{1,40}', config['project']):
             raise Failure('Invalid Compose project name')
         if not re.fullmatch(r'\d+\.\d+\.\d+', config['version']):
@@ -301,13 +348,16 @@ class Manager:
             'DD_SESSION_COOKIE_SECURE': str(c['https']), 'DD_CSRF_COOKIE_SECURE': str(c['https']),
             'DD_SECURE_PROXY_SSL_HEADER': str(c['https']),
             'DD_DATABASE_READINESS_TIMEOUT': '120',
-            'DD_CELERY_WORKER_POOL_TYPE': 'prefork', 'DD_CELERY_WORKER_CONCURRENCY': '2',
-            'DD_CELERY_WORKER_AUTOSCALE_MIN': '2', 'DD_CELERY_WORKER_AUTOSCALE_MAX': '2',
+            'DD_CELERY_WORKER_POOL_TYPE': 'prefork', 'DD_CELERY_WORKER_CONCURRENCY': str(c['worker_concurrency']),
+            'DD_CELERY_WORKER_AUTOSCALE_MIN': str(c['worker_concurrency']), 'DD_CELERY_WORKER_AUTOSCALE_MAX': str(c['worker_concurrency']),
             'DD_CELERY_WORKER_PREFETCH_MULTIPLIER': '1',
+            'DD_DATA_UPLOAD_MAX_MEMORY_SIZE': str(c['data_upload_max_memory_mb'] * 1024**2),
         }
         for name, service in doc['services'].items():
             service['restart'] = 'unless-stopped' if name != 'initializer' else 'no'
             service['logging'] = {'driver': 'json-file', 'options': {'max-size': '10m', 'max-file': '3'}}
+            if name in c['resource_limits_gib']:
+                service['mem_limit'] = f'{c["resource_limits_gib"][name]}g'
             if name in ('uwsgi', 'initializer', 'celerybeat', 'celeryworker'):
                 service['environment'] = dict(common)
             if name == 'initializer':
@@ -315,17 +365,33 @@ class Manager:
                     'DD_ADMIN_MAIL': 'admin@localhost', 'DD_ADMIN_FIRST_NAME': 'Admin', 'DD_ADMIN_LAST_NAME': 'User',
                     'DD_ADMIN_PASSWORD': s['DD_ADMIN_PASSWORD'], 'DD_JIRA_WEBHOOK_SECRET': s['DD_JIRA_WEBHOOK_SECRET']})
             if name == 'uwsgi':
-                service['environment']['DD_UWSGI_EXTRA_ARGS'] = '--master --stats /tmp/ddm-uwsgi-stats.sock'
+                service['environment'].update({
+                    'DD_UWSGI_NUM_OF_PROCESSES': str(c['uwsgi_processes']),
+                    'DD_UWSGI_NUM_OF_THREADS': str(c['uwsgi_threads']),
+                    'DD_UWSGI_EXTRA_ARGS': f'--master --stats /tmp/ddm-uwsgi-stats.sock --socket-timeout {c["request_timeout"]}',
+                })
             if name == 'postgres':
                 service['environment'] = {'PGDATA': '/var/lib/postgresql/18/docker', 'POSTGRES_DB': 'defectdojo',
                                           'POSTGRES_USER': 'defectdojo', 'POSTGRES_PASSWORD': s['DD_DATABASE_PASSWORD']}
                 # PostgreSQL 18 declares this parent as VOLUME; bind the named volume there.
                 service['volumes'] = [{'type': 'volume', 'source': 'defectdojo_postgres', 'target': '/var/lib/postgresql'}]
+                if c['postgres_settings']:
+                    service['command'] = ['postgres']
+                    for key, value in sorted(c['postgres_settings'].items()):
+                        service['command'].extend(['-c', f'{key}={value}'])
+                    service['shm_size'] = '1g'
             if name == 'valkey':
                 service['command'] = ['valkey-server', '--appendonly', 'yes']
             if name == 'nginx':
                 service['environment'] = {'DD_UWSGI_HOST': 'uwsgi', 'DD_UWSGI_PORT': '3031', 'NGINX_METRICS_ENABLED': 'false'}
                 service['ports'] = [{'target': 8080, 'published': str(c['port']), 'host_ip': '127.0.0.1', 'protocol': 'tcp'}]
+                # The pinned entrypoint has no upload/timeout environment options.
+                service['entrypoint'] = ['/bin/sh', '-ec',
+                    "sed -i -E 's/client_max_body_size [^;]+;/client_max_body_size " + str(c['upload_max_mb']) + "m;/; "
+                    "s/uwsgi_read_timeout [^;]+;/uwsgi_read_timeout " + str(c['request_timeout']) + ";/; "
+                    "/^[[:space:]]*client_body_timeout /d; "
+                    "/^http \\{/a\\ client_body_timeout " + str(c['upload_timeout']) + "; uwsgi_send_timeout " + str(c['request_timeout']) + ";"
+                    "' /etc/nginx/nginx.conf; exec /entrypoint-nginx.sh"]
         generation = read_json(self.state / 'volumes.json')['generation']
         if not re.fullmatch(r'[a-z0-9-]+', generation):
             raise Failure('Invalid volume generation')
@@ -335,7 +401,7 @@ class Manager:
             network.pop('name', None)
         write_json(self.state / 'compose.json', doc)
 
-    def preflight(self):
+    def preflight(self, *, check_backup=True):
         log('Checking Docker, Compose, disk space and pinned configuration')
         version = self.run(['docker', 'compose', 'version', '--short']).strip().lstrip('v')
         numbers = tuple(int(x) for x in version.split('.')[:2])
@@ -346,9 +412,150 @@ class Manager:
             raise Failure('Docker Engine 25+ is required; install it explicitly')
         if info['OSType'] != 'linux' or info['Architecture'] not in ('x86_64', 'amd64'):
             raise Failure('This deployment is validated for Linux amd64 only')
-        if shutil.disk_usage(self.state).free < 5 * 1024**3:
-            raise Failure('Less than 5 GiB free; provision space for images, database and multiple backups')
+        self.storage_check(info=info, check_backup=check_backup)
         self.compose('config', '--quiet')
+
+    def filesystem(self, path):
+        # Mountinfo avoids traversing root-owned Docker directories to find their filesystem.
+        path = Path(path).absolute()
+        mounts = []
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            fields = line.split()
+            mount = Path(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4]))
+            if path.is_relative_to(mount):
+                mounts.append((mount, fields[fields.index('-') + 1]))
+        if not mounts:
+            raise Failure(f'Cannot identify filesystem for {path}')
+        return max(mounts, key=lambda item: len(item[0].parts))
+
+    def require_space(self, demands):
+        totals = {}
+        for path, amount in demands:
+            mount, _ = self.filesystem(path)
+            device = mount.stat().st_dev
+            previous = totals.get(device, (mount, 0))
+            totals[device] = (mount, previous[1] + amount)
+        reserve = self.config['disk_reserve_gib'] * GIB
+        for mount, needed in totals.values():
+            free = shutil.disk_usage(mount).free
+            log(f'Disk {mount}: free={free / GIB:.1f} GiB, additional={needed / GIB:.1f} GiB, reserve={reserve / GIB} GiB')
+            if free < needed + reserve:
+                raise Failure(f'Insufficient free space on {mount}; need additional data plus reserve, without deleting old generations')
+
+    def backup_target(self):
+        destination = self.config['backup_copy_dir']
+        if not destination:
+            return None
+        target = Path(destination).resolve()
+        expected = self.config['backup_copy_mount']
+        if not expected or not os.path.ismount(expected) or self.filesystem(target)[0] != Path(expected).resolve():
+            raise Failure('Separate backup mount is missing or does not contain backup_copy_dir; refusing local fallback')
+        if not target.is_dir() or target.stat().st_mode & 0o077 or target.is_relative_to(self.backup_root()):
+            raise Failure('Separate backup destination must already exist with mode 0700, distinct from backup_dir')
+        if self.config['profile'] == 'single-vm-production' and self.filesystem(target)[1] not in ('nfs', 'nfs4', 'cifs', 'fuse.sshfs', 'ceph', 'fuse.glusterfs'):
+            raise Failure('Production backup_copy_mount must be a remote filesystem outside this VM')
+        return target
+
+    def storage_check(self, *, info=None, operation=None, backup=None, check_backup=True):
+        # Paths below refer to this host. A remote daemon would invalidate these checks.
+        endpoint = None if os.environ.get('DOCKER_CONTEXT') else os.environ.get('DOCKER_HOST')
+        if not endpoint:
+            context = json.loads(self.run(['docker', 'context', 'inspect']))
+            endpoint = context[0]['Endpoints']['docker']['Host']
+        if not endpoint.startswith('unix://'):
+            raise Failure('Storage checks require a local Docker daemon over a Unix socket')
+        info = info or json.loads(self.run(['docker', 'info', '--format', '{{json .}}']))
+        docker_root = Path(info['DockerRootDir']).resolve()
+        demands = [(self.state, 0), (docker_root, 0)]
+        data_mount = self.config['data_mount']
+        if data_mount:
+            if not os.path.ismount(data_mount):
+                raise Failure('data_mount is not mounted; refusing system-disk fallback')
+            if self.filesystem(docker_root)[0] != Path(data_mount).resolve():
+                raise Failure('DockerRootDir is not on data_mount')
+        image_dir = self.config['image_storage_dir']
+        snapshotter = any('io.containerd.snapshotter' in str(row) for row in info.get('DriverStatus', []))
+        if snapshotter and not image_dir:
+            raise Failure('Set image_storage_dir to the verified containerd image-store path')
+        if image_dir:
+            image_dir = Path(image_dir).resolve()
+            if not image_dir.is_dir() or (data_mount and self.filesystem(image_dir)[0] != Path(data_mount).resolve()):
+                raise Failure('Image storage directory is missing or outside data_mount')
+            demands.append((image_dir, 0))
+        names = self.run(['docker', 'volume', 'ls', '--format', '{{.Name}}']).split()
+        doc = read_json(self.state / 'compose.json')
+        for service, definition in doc['services'].items():
+            for cid in self.compose('ps', '-a', '-q', service).split():
+                mounts = json.loads(self.run(['docker', 'inspect', '--format', '{{json .Mounts}}', cid]))
+                for expected in definition.get('volumes', []):
+                    if expected['type'] != 'volume':
+                        continue
+                    name = doc['volumes'][expected['source']]['name']
+                    if not any(m.get('Type') == 'volume' and m.get('Name') == name and m.get('Destination') == expected['target'] for m in mounts):
+                        raise Failure(f'Unexpected live mount for {service}:{expected["target"]}; inspect before maintenance')
+        data_bytes = 0
+        data_paths = [docker_root]
+        for key in ('defectdojo_postgres', 'defectdojo_media', 'defectdojo_redis'):
+            name = doc['volumes'][key]['name']
+            if name not in names:
+                continue
+            volume = json.loads(self.run(['docker', 'volume', 'inspect', name]))[0]
+            path = Path(volume['Mountpoint']).absolute()
+            log(f'Volume {name}: {path}')
+            if data_mount and self.filesystem(path)[0] != Path(data_mount).resolve():
+                raise Failure(f'Volume {name} is outside data_mount')
+            demands.append((path, 0))
+            data_paths.append(path)
+            if key != 'defectdojo_redis':
+                image = doc['services']['postgres']['image']
+                size = self.run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only',
+                                 '--mount', f'type=volume,source={name},target=/probe,readonly',
+                                 '--entrypoint', 'du', image, '-sk', '/probe'], timeout=self.config['backup_timeout'])
+                data_bytes += int(size.split()[0]) * 1024
+        root = self.backup_root()
+        target = self.backup_target() if check_backup and operation != 'restore' else None
+        if check_backup and operation != 'restore':
+            demands.append((root, 0))
+        if target:
+            demands.append((target, 0))
+        estimate = max(data_bytes, self.config['backup_estimate_gib'] * GIB)
+        if operation == 'backup':
+            demands.append((root, estimate))
+            if target:
+                demands.append((target, estimate))
+        elif operation == 'restore':
+            demands.append((backup, 0))
+            manifest = read_json(backup / 'manifest.json')
+            # Raw source size includes indexes; WAL/index construction needs additional headroom.
+            restored = max(data_bytes, manifest.get('source_data_bytes', 0), self.config['restore_estimate_gib'] * GIB)
+            archive = sum(p.stat().st_size for p in backup.rglob('*') if p.is_file())
+            restored = max(restored, archive * 4)
+            mounts = {self.filesystem(path)[0] for path in data_paths}
+            devices = {mount.stat().st_dev: mount for mount in mounts}
+            # Each distinct data filesystem must fit a full new generation conservatively.
+            demands.extend((mount, restored * 3 // 2) for mount in devices.values())
+        self.require_space(demands)
+        return data_bytes
+
+    def begin_maintenance(self, action):
+        path = self.state / 'maintenance.json'
+        if not path.exists() or read_json(path).get('finished'):
+            write_json(path, {'action': action, 'started': dt.datetime.now(dt.timezone.utc).isoformat()})
+
+    def report_maintenance(self, *, finished=False, persist=True):
+        path = self.state / 'maintenance.json'
+        if not path.exists():
+            return
+        report = read_json(path)
+        if report.get('finished'):
+            return
+        now = dt.datetime.now(dt.timezone.utc)
+        report['elapsed_seconds'] = (now - dt.datetime.fromisoformat(report['started'])).total_seconds()
+        if finished:
+            report['finished'] = now.isoformat()
+        if persist:
+            write_json(path, report)
+        log(f'Maintenance ingress downtime: {report["elapsed_seconds"]:.1f}s; ' + ('ready' if finished else 'ongoing, ingress recovery not confirmed'))
 
     def pull(self, version=None):
         manifest, _ = bundle(self.release_dir(version))
@@ -392,6 +599,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
 
     def quiesce(self):
         self.require_no_initializer()
+        self.begin_maintenance('drain')
         self.set_phase('maintenance', action='draining')
         log('Closing ingress gracefully and stopping job producers; waiting for imports and Celery queues')
         self.stop_service('nginx', 'SIGQUIT')
@@ -461,6 +669,40 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
             raise Failure('Celery scheduler is not running')
         self.http_check(frontend=frontend)
 
+    def runtime_settings(self):
+        c = self.config
+        nginx = self.compose('exec', '-T', 'nginx', 'nginx', '-T')
+        for directive, value in {'client_max_body_size': f'{c["upload_max_mb"]}m',
+                                 'uwsgi_read_timeout': str(c['request_timeout']),
+                                 'uwsgi_send_timeout': str(c['request_timeout']),
+                                 'client_body_timeout': str(c['upload_timeout'])}.items():
+            actual = re.findall(r'\b' + directive + r'\s+([^;]+);', nginx)
+            if not actual or any(v.strip() != value for v in actual):
+                raise Failure(f'Container nginx setting differs from config: {directive}')
+        actual = self.shell("""
+import json, socket
+from django.conf import settings
+with socket.socket(socket.AF_UNIX) as s:
+    s.settimeout(10)
+    s.connect('/tmp/ddm-uwsgi-stats.sock')
+    with s.makefile('rb') as stream:
+        workers = json.load(stream)['workers']
+print('DD_RESULT=' + json.dumps({'upload': settings.DATA_UPLOAD_MAX_MEMORY_SIZE,
+    'processes': len(workers), 'threads': min(len(w['cores']) for w in workers)}))
+""")
+        if actual != {'upload': c['data_upload_max_memory_mb'] * 1024**2,
+                       'processes': c['uwsgi_processes'], 'threads': c['uwsgi_threads']}:
+            raise Failure('Effective application/uWSGI settings differ from config; apply with controlled start')
+        conditions = []
+        for key, value in c['postgres_settings'].items():
+            current = f"current_setting('{key}')"
+            conditions.append(f"pg_size_bytes({current}) = pg_size_bytes('{value}')" if key in PG_MEMORY else f"{current}::int = {value}")
+        if conditions:
+            result = self.compose('exec', '-T', 'postgres', 'psql', '-U', 'defectdojo', '-d', 'defectdojo', '-Atc', 'SELECT ' + ' AND '.join(conditions))
+            if result.strip() != 't':
+                raise Failure('Effective PostgreSQL settings differ from config')
+        log(f'Container/application settings verified. Check host proxy separately: body={c["upload_max_mb"]}m, read/send={c["request_timeout"]}s, body timeout={c["upload_timeout"]}s')
+
     def activate(self):
         if any(self.compose('ps', '-q', service).strip() for service in WRITERS):
             self.quiesce()
@@ -498,6 +740,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
                     log(f'Could not confirm {service} stopped; inspect containers before recovery')
             raise
         self.set_phase('ready')
+        self.report_maintenance(finished=True)
         log(f'DefectDojo {self.config["version"]} is ready at {self.config["site_url"]}')
 
     def install(self):
@@ -513,8 +756,11 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
         return (self.root / self.config['backup_dir']).resolve()
 
     def backup(self, *, quiesced=False, upgrade=False):
+        data_bytes = self.storage_check(operation='backup')
         if not quiesced:
+            self.begin_maintenance('backup')
             self.quiesce()
+            data_bytes = self.storage_check(operation='backup')
         root = self.backup_root()
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if root.stat().st_mode & 0o077:
@@ -525,9 +771,9 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
         log('Creating quiesced PostgreSQL and media backup')
         try:
             with (temp / 'database.dump').open('wb') as output:
-                self.compose('exec', '-T', 'postgres', 'pg_dump', '-U', 'defectdojo', '-d', 'defectdojo', '--format=custom', '--no-owner', stdout=output)
+                self.compose('exec', '-T', 'postgres', 'pg_dump', '-U', 'defectdojo', '-d', 'defectdojo', '--format=custom', '--no-owner', stdout=output, timeout=self.config['backup_timeout'])
             with (temp / 'media.tar.gz').open('wb') as output:
-                self.compose('run', '--rm', '--no-deps', '-T', '--entrypoint', 'tar', 'uwsgi', '-C', '/app/media', '-czf', '-', '.', stdout=output)
+                self.compose('run', '--rm', '--no-deps', '-T', '--entrypoint', 'tar', 'uwsgi', '-C', '/app/media', '-czf', '-', '.', stdout=output, timeout=self.config['backup_timeout'])
             for name_ in ['config.json', 'secrets.json', 'compose.json', 'volumes.json']:
                 shutil.copyfile(self.state / name_, temp / name_)
             shutil.copytree(self.release_dir(), temp / 'bundle')
@@ -538,7 +784,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
                 images[image] = {k: images[image][k] for k in ('Id', 'RepoDigests')}
             files = {str(p.relative_to(temp)): sha256(p) for p in sorted(temp.rglob('*')) if p.is_file()}
             write_json(temp / 'manifest.json', {'format': 1, 'version': self.config['version'], 'created': dt.datetime.now(dt.timezone.utc).isoformat(),
-                'images': release['images'], 'image_inspect': images, 'files': files, 'kind': 'upgrade' if upgrade else 'daily'})
+                'images': release['images'], 'image_inspect': images, 'files': files, 'kind': 'upgrade' if upgrade else 'daily', 'source_data_bytes': data_bytes})
             for path in temp.rglob('*'):
                 path.chmod(0o700 if path.is_dir() else 0o600)
             verify_backup(temp)
@@ -555,20 +801,19 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
             self.activate()
         return final
 
-    def validate_dump(self, backup):
+    def validate_dump(self, backup, *, restoring=False):
         manifest = read_json(backup / 'bundle/release.json')
         with (backup / 'database.dump').open('rb') as source:
-            self.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', 'pg_restore', manifest['images']['postgres'], '--list'], stdin=source)
+            self.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', 'pg_restore', manifest['images']['postgres'], '--list'], stdin=source, timeout=self.config['restore_timeout' if restoring else 'backup_timeout'])
 
     def copy_backup(self, backup):
         destination = self.config['backup_copy_dir']
         if not destination:
             return
-        target = Path(destination).resolve()
-        if not target.is_dir() or target.stat().st_mode & 0o077 or target.is_relative_to(self.backup_root()):
-            raise Failure('Separate backup destination must already exist with mode 0700, distinct from backup_dir')
+        target = self.backup_target()
         temp = target / ('.partial-' + backup.name)
         shutil.copytree(backup, temp)
+        self.backup_target()
         verify_backup(temp)
         temp.rename(target / backup.name)
         log('Separate backup copy verified; remote retention is operator-managed')
@@ -600,6 +845,8 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
             raise Failure('Upgrade requires a ready deployment')
         self.preflight()
         self.pull(target)
+        self.storage_check(operation='backup')
+        self.begin_maintenance('upgrade')
         self.quiesce()
         backup = self.backup(quiesced=True, upgrade=True)
         self.set_phase('maintenance', action='upgrade', backup=str(backup), target=target)
@@ -614,7 +861,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
             raise Failure(f'Restore replaces the active database/media/configuration. Pass --confirm "{expected}" after reviewing the backup')
         manifest = verify_backup(backup)
         log(f'Validating restore of {manifest["version"]}; existing volumes will be preserved')
-        self.validate_dump(backup)
+        self.validate_dump(backup, restoring=True)
         old_config = dict(self.config)
         # Validate restored configuration before stopping any current service.
         saved = read_json(backup / 'config.json')
@@ -622,6 +869,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
             raise Failure('Restored config version differs from manifest')
         self.validate_config(saved, read_json(backup / 'secrets.json'))
         self.require_no_initializer()
+        self.storage_check(operation='restore', backup=backup)
         for image in sorted(set(manifest['images'].values())):
             self.run(['docker', 'pull', image], timeout=max(900, self.config['command_timeout']))
         previous = self.state / 'history' / dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
@@ -631,6 +879,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
                 shutil.copyfile(self.state / name, previous / name)
                 (previous / name).chmod(0o600)
         self.set_phase('restoring', backup=str(backup), previous_metadata=str(previous))
+        self.begin_maintenance('restore')
         for service in WRITERS:
             self.stop_service(service, 'SIGQUIT' if service == 'nginx' else 'SIGTERM')
         self.stop_service('postgres')
@@ -641,7 +890,7 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
         if release_path.exists():
             shutil.rmtree(release_path)
         shutil.copytree(backup / 'bundle', release_path)
-        for key in ['project', 'port', 'site_url', 'allowed_hosts', 'https', 'backup_dir', 'backup_copy_dir', 'notification_hook']:
+        for key in set(OPTIONAL_DEFAULTS) | {'project', 'port', 'site_url', 'allowed_hosts', 'https', 'backup_dir', 'backup_copy_dir', 'notification_hook', 'command_timeout', 'migration_timeout', 'drain_timeout', 'health_timeout'}:
             saved[key] = old_config[key]
         write_json(self.state / 'config.json', saved)
         write_json(self.state / 'secrets.json', read_json(backup / 'secrets.json'))
@@ -660,9 +909,9 @@ print(sum(c['in_request'] for w in workers for c in w['cores']))
                     raise
                 time.sleep(2)
         with (backup / 'database.dump').open('rb') as source:
-            self.compose('exec', '-T', 'postgres', 'pg_restore', '-U', 'defectdojo', '-d', 'defectdojo', '--exit-on-error', '--no-owner', stdin=source)
+            self.compose('exec', '-T', 'postgres', 'pg_restore', '-U', 'defectdojo', '-d', 'defectdojo', '--exit-on-error', '--no-owner', stdin=source, timeout=self.config['restore_timeout'])
         with (backup / 'media.tar.gz').open('rb') as source:
-            self.compose('run', '--rm', '--no-deps', '-T', '--user', '0', '--entrypoint', 'tar', 'uwsgi', '-C', '/app/media', '-xzf', '-', stdin=source)
+            self.compose('run', '--rm', '--no-deps', '-T', '--user', '0', '--entrypoint', 'tar', 'uwsgi', '-C', '/app/media', '-xzf', '-', stdin=source, timeout=self.config['restore_timeout'])
         self.activate()
         log('Restore complete; previous volume generations retained for manual recovery')
 
@@ -714,6 +963,7 @@ def main(argv=None):
             else:
                 manager.load()
                 if args.command == 'status':
+                    manager.report_maintenance()
                     log(json.dumps(manager.phase()))
                     if (manager.state / 'compose.json').exists():
                         log(manager.compose('ps', '-a'))
@@ -729,6 +979,7 @@ def main(argv=None):
                         manager.preflight()
                         if manager.phase()['phase'] != 'new':
                             manager.health(frontend=True)
+                            manager.runtime_settings()
                         else:
                             log('Host and configuration checks passed; application is not installed yet')
                             return 0
@@ -739,7 +990,7 @@ def main(argv=None):
                             raise Failure('Restore is incomplete; rerun the explicit restore command, do not start a partial database')
                         if manager.phase()['phase'] not in ('ready', 'stopped') and not args.resume:
                             raise Failure('Incomplete maintenance; inspect status then explicitly use start --resume')
-                        manager.preflight()
+                        manager.preflight(check_backup=False)
                         if manager.phase()['phase'] in ('ready', 'maintenance'):
                             manager.quiesce()
                         manager.activate()
@@ -761,9 +1012,14 @@ def main(argv=None):
             manager.notify(f'{args.command}:success')
     except (Failure, OSError, ValueError, KeyError, TypeError) as exc:
         log('ERROR: ' + manager.redact(str(exc)))
+        # The lock may have been refused; never mutate another operation's report here.
+        with contextlib.suppress(Failure, OSError, ValueError, KeyError, TypeError):
+            manager.report_maintenance(persist=False)
         manager.notify(f'{args.command}:failure')
         return 1
     except KeyboardInterrupt:
+        with contextlib.suppress(Failure, OSError, ValueError, KeyError, TypeError):
+            manager.report_maintenance(persist=False)
         log('Interrupted; inspect status before resuming. No automatic restore performed')
         return 130
     return 0

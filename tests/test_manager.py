@@ -2,6 +2,7 @@ import io
 import json
 import pathlib
 import sys
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -24,10 +25,19 @@ class ManagerTests(unittest.TestCase):
         config['backup_dir'] = str(pathlib.Path(self.tmp.name) / 'backups')
         dm.write_json(self.state / 'config.json', config)
         self.calls = []
+        disk = patch('dd_manager.shutil.disk_usage', return_value=type('Usage', (), {'free': 1024 * 1024**3})())
+        disk.start()
+        self.addCleanup(disk.stop)
 
     def docker(self, args, **kwargs):
         self.calls.append(args)
         text = ' '.join(args)
+        if 'compose version --short' in text:
+            return '2.24.0'
+        if 'docker context inspect' in text:
+            return json.dumps([{'Endpoints': {'docker': {'Host': 'unix:///var/run/docker.sock'}}}])
+        if 'docker info' in text:
+            return json.dumps({'DockerRootDir': '/tmp', 'ServerVersion': '29.0', 'OSType': 'linux', 'Architecture': 'amd64'})
         if 'pg_dump' in text:
             kwargs['stdout'].write(b'PGDMP-test')
         if '-C /app/media -czf - .' in text:
@@ -43,6 +53,274 @@ class ManagerTests(unittest.TestCase):
         self.m.load()
         self.m.render()
         self.m.set_phase('ready')
+
+    def test_old_config_gets_pilot_defaults_and_rejects_bad_tuning(self):
+        config = dm.read_json(self.state / 'config.json')
+        for key in dm.OPTIONAL_DEFAULTS:
+            config.pop(key, None)
+        dm.write_json(self.state / 'config.json', config)
+        self.m.load()
+        self.assertEqual(self.m.config['worker_concurrency'], 2)
+        self.assertEqual(self.m.config['uwsgi_processes'], 4)
+        self.assertEqual(self.m.config['backup_timeout'], 7200)
+        for key, value in [('worker_concurrency', True), ('uwsgi_threads', 0),
+                           ('postgres_settings', {'work_mem': '8MB; bad'}),
+                           ('resource_limits_gib', {'unknown': 1})]:
+            config = dict(self.m.config, **{key: value})
+            with self.subTest(key=key), self.assertRaises(dm.Failure):
+                self.m.validate_config(config, self.m.secrets)
+
+    def test_production_render_is_bounded_and_keeps_release_intact(self):
+        self.m.load()
+        self.m.config.update(dm.read_json(ROOT / 'config.production.example.json'))
+        self.m.config['worker_concurrency'] = 3
+        before = dm.sha256(ROOT / 'releases/3.4.202/compose.json')
+        self.m.validate_config(self.m.config, self.m.secrets)
+        self.m.render()
+        services = dm.read_json(self.state / 'compose.json')['services']
+        env = services['celeryworker']['environment']
+        self.assertEqual(env['DD_CELERY_WORKER_AUTOSCALE_MAX'], '3')
+        self.assertEqual(env['DD_CELERY_WORKER_AUTOSCALE_MIN'], '3')
+        self.assertEqual(services['uwsgi']['environment']['DD_UWSGI_NUM_OF_PROCESSES'], '2')
+        self.assertIn('work_mem=8MB', services['postgres']['command'])
+        self.assertEqual(services['postgres']['mem_limit'], '20g')
+        self.assertIn('client_max_body_size 800m', services['nginx']['entrypoint'][2])
+        self.assertEqual(before, dm.sha256(ROOT / 'releases/3.4.202/compose.json'))
+
+    def test_copy_target_without_mount_fails_before_drain(self):
+        self.prepared()
+        self.m.config.update(backup_copy_dir=self.tmp.name, backup_copy_mount='/missing-backup')
+        with patch.object(self.m, 'run', side_effect=self.docker), patch.object(self.m, 'quiesce') as drain, self.assertRaises(dm.Failure):
+            self.m.backup()
+        drain.assert_not_called()
+
+    def test_space_budget_adds_demands_on_shared_filesystem(self):
+        self.prepared()
+        with patch('dd_manager.shutil.disk_usage', return_value=type('Usage', (), {'free': 30 * 1024**3})()):
+            with self.assertRaises(dm.Failure):
+                self.m.require_space([(self.state, 20 * 1024**3), (self.state, 20 * 1024**3)])
+
+    def test_new_timeouts_reach_dump_and_restore_and_old_backup_config(self):
+        self.prepared()
+        self.m.config.update(backup_timeout=1234, restore_timeout=2345, worker_concurrency=3)
+        dm.write_json(self.state / 'config.json', self.m.config)
+        calls = []
+        def docker(args, **kwargs):
+            calls.append((args, kwargs.get('timeout')))
+            return self.docker(args, **kwargs)
+        with patch.object(self.m, 'run', side_effect=docker), patch.object(self.m, 'quiesce'), patch.object(self.m, 'activate'):
+            backup = self.m.backup()
+            # Pre-feature backups have only the original config keys and no size metadata.
+            config = dm.read_json(backup / 'config.json')
+            for key in dm.OPTIONAL_DEFAULTS:
+                config.pop(key, None)
+            dm.write_json(backup / 'config.json', config)
+            manifest = dm.read_json(backup / 'manifest.json')
+            manifest['files']['config.json'] = dm.sha256(backup / 'config.json')
+            manifest.pop('source_data_bytes', None)
+            dm.write_json(backup / 'manifest.json', manifest)
+            self.m.restore(backup, confirm='RESTORE defectdojo')
+        self.assertEqual(self.m.config['worker_concurrency'], 3)
+        self.assertEqual(self.m.config['backup_timeout'], 1234)
+        self.assertTrue(any('pg_dump' in args and timeout == 1234 for args, timeout in calls))
+        self.assertTrue(any('pg_restore' in args and '--exit-on-error' in args and timeout == 2345 for args, timeout in calls))
+
+    def test_storage_uses_actual_volume_sizes_and_rejects_restore_without_room(self):
+        self.prepared()
+        name = 'defectdojo_defectdojo_postgres_initial'
+        def docker(args, **kwargs):
+            if args[:3] == ['docker', 'volume', 'ls']:
+                return name
+            if args[:3] == ['docker', 'volume', 'inspect']:
+                return json.dumps([{'Mountpoint': '/tmp/pgdata'}])
+            if '--entrypoint' in args and 'du' in args:
+                return '104857600 /probe'  # 100 GiB raw, independent of compressed dump size
+            return self.docker(args, **kwargs)
+        with patch.object(self.m, 'run', side_effect=docker):
+            self.assertEqual(self.m.storage_check(), 100 * 1024**3)
+            with patch.object(self.m, 'quiesce'), patch.object(self.m, 'activate'):
+                backup = self.m.backup()
+            self.assertEqual(dm.read_json(backup / 'manifest.json')['source_data_bytes'], 100 * 1024**3)
+            self.m.config['restore_estimate_gib'] = 1
+            with patch('dd_manager.shutil.disk_usage', return_value=type('Usage', (), {'free': 140 * 1024**3})()), patch.object(self.m, 'stop_service') as stop:
+                with self.assertRaisesRegex(dm.Failure, 'Insufficient free space'):
+                    self.m.restore(backup, confirm='RESTORE defectdojo')
+                stop.assert_not_called()
+
+    def test_data_mount_loss_and_wrong_volume_path_are_rejected(self):
+        self.prepared()
+        self.m.config['data_mount'] = '/srv/defectdojo'
+        with patch.object(self.m, 'run', side_effect=self.docker), patch('dd_manager.os.path.ismount', return_value=False):
+            with self.assertRaisesRegex(dm.Failure, 'data_mount is not mounted'):
+                self.m.storage_check()
+        name = 'defectdojo_defectdojo_media_initial'
+        def docker(args, **kwargs):
+            if args[:3] == ['docker', 'info', '--format']:
+                return json.dumps({'DockerRootDir': '/srv/defectdojo/docker'})
+            if args[:3] == ['docker', 'volume', 'ls']:
+                return name
+            if args[:3] == ['docker', 'volume', 'inspect']:
+                return json.dumps([{'Mountpoint': '/var/lib/docker/volumes/media/_data'}])
+            return self.docker(args, **kwargs)
+        def filesystem(path):
+            return (pathlib.Path('/srv/defectdojo') if str(path).startswith('/srv/defectdojo') else pathlib.Path('/'), 'ext4')
+        with patch.object(self.m, 'run', side_effect=docker), patch('dd_manager.os.path.ismount', return_value=True), patch.object(self.m, 'filesystem', side_effect=filesystem):
+            with self.assertRaisesRegex(dm.Failure, 'outside data_mount'):
+                self.m.storage_check()
+
+    def test_maintenance_report_spans_backup_migration_and_resume(self):
+        self.prepared()
+        self.m.begin_maintenance('backup')
+        report = dm.read_json(self.state / 'maintenance.json')
+        report['started'] = (dm.dt.datetime.now(dm.dt.timezone.utc) - dm.dt.timedelta(seconds=9000)).isoformat()
+        dm.write_json(self.state / 'maintenance.json', report)
+        self.m.begin_maintenance('retry')
+        self.m.report_maintenance()
+        report = dm.read_json(self.state / 'maintenance.json')
+        self.assertNotIn('finished', report)
+        self.assertGreaterEqual(report['elapsed_seconds'], 9000)
+        with patch.object(self.m, 'run', side_effect=self.docker), patch.object(self.m, 'migrate'), patch.object(self.m, 'health'), patch.object(self.m, 'http_check'):
+            self.m.activate()
+        report = dm.read_json(self.state / 'maintenance.json')
+        self.assertIn('finished', report)
+        self.assertEqual(report['action'], 'backup')
+        self.assertGreaterEqual(report['elapsed_seconds'], 9000)
+
+    def test_long_drain_and_migration_deadlines_do_not_force_kill(self):
+        self.prepared()
+        self.m.config.update(drain_timeout=14400, migration_timeout=21600)
+        def docker(args, **kwargs):
+            self.calls.append((args, kwargs))
+            if 'ps' in args:
+                return 'container-id'
+            if 'inspect' in args:
+                return dm.read_json(self.state / 'compose.json')['services']['initializer']['image']
+            if 'wait' in args:
+                return '0'
+            return ''
+        with patch.object(self.m, 'run', side_effect=docker):
+            self.m.stop_service('celeryworker')
+            self.m.migrate()
+        self.assertTrue(any('stop' in args and args[args.index('--time') + 1] == '-1' and kwargs['timeout'] == 14400 for args, kwargs in self.calls))
+        self.assertTrue(any('wait' in args and kwargs['timeout'] == 21600 for args, kwargs in self.calls))
+
+    def test_doctor_rejects_ineffective_upload_settings(self):
+        self.prepared()
+        config = 'client_max_body_size 100m; uwsgi_read_timeout 1800; client_body_timeout 60; uwsgi_send_timeout 1800;'
+        with patch.object(self.m, 'compose', return_value=config), patch.object(self.m, 'shell', return_value={'upload': 8388608, 'processes': 4, 'threads': 4}):
+            with self.assertRaisesRegex(dm.Failure, 'nginx'):
+                self.m.runtime_settings()
+        config = config.replace('100m', '800m')
+        with patch.object(self.m, 'compose', return_value=config), patch.object(self.m, 'shell', return_value={'upload': 8388608, 'processes': 4, 'threads': 4}):
+            self.m.runtime_settings()
+        with patch.object(self.m, 'compose', return_value=config), patch.object(self.m, 'shell', return_value={'upload': 1048576, 'processes': 4, 'threads': 4}):
+            with self.assertRaisesRegex(dm.Failure, 'application'):
+                self.m.runtime_settings()
+
+    def test_existing_container_mount_cannot_hide_wrong_volume(self):
+        self.prepared()
+        def docker(args, **kwargs):
+            if args[-4:] == ['ps', '-a', '-q', 'postgres']:
+                return 'pg-id'
+            if args[:2] == ['docker', 'inspect']:
+                return json.dumps([{'Type': 'volume', 'Name': 'wrong-volume', 'Destination': '/var/lib/postgresql'}])
+            return self.docker(args, **kwargs)
+        with patch.object(self.m, 'run', side_effect=docker):
+            with self.assertRaisesRegex(dm.Failure, 'mount'):
+                self.m.storage_check()
+
+    def test_nginx_adapter_is_idempotent_on_container_restart(self):
+        self.prepared()
+        script = dm.read_json(self.state / 'compose.json')['services']['nginx']['entrypoint'][2]
+        template = pathlib.Path(self.tmp.name) / 'nginx.conf'
+        template.write_text('http {\n client_max_body_size 800m;\n server { location / { uwsgi_read_timeout 1800; } }\n}\n')
+        adapter = script.split('; exec /entrypoint-nginx.sh')[0].replace('/etc/nginx/nginx.conf', str(template))
+        subprocess.run(['/bin/sh', '-ec', adapter], check=True)
+        once = template.read_text()
+        subprocess.run(['/bin/sh', '-ec', adapter], check=True)
+        self.assertEqual(template.read_text(), once)
+        self.assertEqual(once.count('client_body_timeout'), 1)
+
+    def test_upgrade_preserves_tuning_in_config_and_backup(self):
+        config = dm.read_json(self.state / 'config.json')
+        config.update(version='3.4.201', worker_concurrency=3, backup_timeout=1234,
+                      postgres_settings={'work_mem': '16MB'})
+        dm.write_json(self.state / 'config.json', config)
+        self.prepared()
+        with patch.object(self.m, 'run', side_effect=self.docker), patch.object(self.m, 'quiesce'), patch.object(self.m, 'activate'):
+            self.m.upgrade('3.4.202')
+        current = dm.read_json(self.state / 'config.json')
+        backup = next(self.m.backup_root().glob('*-upgrade'))
+        for saved in [current, dm.read_json(backup / 'config.json')]:
+            self.assertEqual(saved['worker_concurrency'], 3)
+            self.assertEqual(saved['backup_timeout'], 1234)
+            self.assertEqual(saved['postgres_settings']['work_mem'], '16MB')
+        self.assertEqual(current['version'], '3.4.202')
+        self.assertIn('work_mem=16MB', dm.read_json(self.state / 'compose.json')['services']['postgres']['command'])
+
+    def test_production_memory_budget_cannot_remove_headroom(self):
+        self.m.load()
+        self.m.config.update(dm.read_json(ROOT / 'config.production.example.json'))
+        self.m.config['resource_limits_gib']['postgres'] = 64
+        with self.assertRaisesRegex(dm.Failure, 'budget'):
+            self.m.validate_config(self.m.config, self.m.secrets)
+
+    def test_image_store_symlink_cannot_hide_system_filesystem(self):
+        self.prepared()
+        link = pathlib.Path(self.tmp.name) / 'images'
+        link.symlink_to('/proc', target_is_directory=True)
+        self.m.config.update(data_mount=str(self.m.filesystem(self.state)[0]), image_storage_dir=str(link))
+        with patch.object(self.m, 'run', side_effect=self.docker), patch('dd_manager.os.path.ismount', return_value=True):
+            with self.assertRaisesRegex(dm.Failure, 'outside data_mount'):
+                self.m.storage_check()
+
+    def test_backup_rechecks_growth_after_draining(self):
+        self.prepared()
+        name = 'defectdojo_defectdojo_postgres_initial'
+        size = 50
+        def docker(args, **kwargs):
+            self.calls.append(args)
+            if args[:3] == ['docker', 'volume', 'ls']:
+                return name
+            if args[:3] == ['docker', 'volume', 'inspect']:
+                return json.dumps([{'Mountpoint': '/tmp/pgdata'}])
+            if '--entrypoint' in args and 'du' in args:
+                return str(size * 1024**2) + ' /probe'
+            return self.docker(args, **kwargs)
+        def drain():
+            nonlocal size
+            size = 150
+        with patch.object(self.m, 'run', side_effect=docker), patch.object(self.m, 'quiesce', side_effect=drain), patch.object(self.m, 'activate'), patch('dd_manager.shutil.disk_usage', return_value=type('Usage', (), {'free': 120 * 1024**3})()):
+            with self.assertRaisesRegex(dm.Failure, 'Insufficient free space'):
+                self.m.backup()
+        self.assertFalse(any('pg_dump' in args for args in self.calls))
+
+    def test_start_resume_does_not_depend_on_remote_backup_mount(self):
+        self.prepared()
+        self.m.config.update(backup_copy_dir='/missing-backup/dojo', backup_copy_mount='/missing-backup')
+        dm.write_json(self.state / 'config.json', self.m.config)
+        self.m.set_phase('failed')
+        with patch.object(dm.Manager, 'run', side_effect=self.docker), patch.object(dm.Manager, 'activate'):
+            self.assertEqual(dm.main(['--state', str(self.state), 'start', '--resume']), 0)
+
+    def test_rejected_lock_cannot_rewrite_maintenance_report(self):
+        self.prepared()
+        self.m.begin_maintenance('backup')
+        report = self.state / 'maintenance.json'
+        before = report.read_bytes()
+        with self.m.lock():
+            self.assertEqual(dm.main(['--state', str(self.state), 'backup']), 1)
+        self.assertEqual(report.read_bytes(), before)
+
+    def test_doctor_checks_effective_postgres_units(self):
+        self.prepared()
+        self.m.config['postgres_settings'] = {'work_mem': '8MB'}
+        nginx = 'client_max_body_size 800m; uwsgi_read_timeout 1800; client_body_timeout 60; uwsgi_send_timeout 1800;'
+        def compose(*args, **kwargs):
+            return 'f' if 'psql' in args else nginx
+        with patch.object(self.m, 'compose', side_effect=compose), patch.object(self.m, 'shell', return_value={'upload': 8388608, 'processes': 4, 'threads': 4}):
+            with self.assertRaisesRegex(dm.Failure, 'PostgreSQL'):
+                self.m.runtime_settings()
 
     def test_secrets_and_loopback(self):
         self.m.load()

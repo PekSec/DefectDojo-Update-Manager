@@ -13,11 +13,16 @@ Pro CLI/connector, Watchtower veya zorunlu SaaS kullanılmaz.
   CLI eksikleri kontrol eder, habersiz paket kurmaz.
 - Docker Hub/GitHub HTTPS çıkışı; kurum CA/proxy'sini Docker daemon ve Python
   trust store'unda önceden yapılandırın.
-- Pilot için **4 vCPU, 16 GiB RAM, 100 GiB SSD** başlangıç önerisidir, yük testi
-  sonucu değildir. Aylık 2–3 bin hostta bulgu sayısı, rapor boyutu ve retention
-  belirleyicidir. Gerçek raporla import süresi, RAM, disk ve kuyruk büyümesini ölçün.
-  Worker başlangıcı iki prefork süreçtir. [Resmî üretim rehberi](https://docs.defectdojo.com/get_started/open_source/running-in-production/)
-  ayrı DB önerir; bu sade pilot PostgreSQL'i aynı VM'de kalıcı volume'de tutar.
+- Hedef **4.000 varlık**, aylık tarama, Info dahil yaklaşık **500.000 birikmiş
+  bulgu**; her ay 500.000 yeni kayıt hedeflenmez. Greenbone ayrı VM'dedir;
+  DefectDojo/PostgreSQL/web/Celery/Valkey aynı Compose VM'sinde kalır.
+- Planlanan üretim başlangıcı: **16 vCPU, 64 GB RAM, 80 GB sistem + genişletilebilir
+  750 GB SSD veri diski**, VM dışında yedek. Bu kaynaklar kapasite garantisi
+  değildir; **500.000 bulguyla yük testi yapılmadı**.
+- Pilot config ve davranışı korunur (worker iki prefork süreç). İsteğe bağlı
+  [tek VM üretim örneği](config.production.example.json), RAM bütçesi, gerçek veri
+  diski kurulumu ve ölçüm/kabul adımları: [üretim rehberi](docs/production.md).
+  Worker CPU sayısına göre otomatik artırılmaz; üretim de iki worker ile başlar.
 
 ## Sıfırdan kurulum ve ilk giriş
 
@@ -34,8 +39,9 @@ AES/Django anahtarlarını yeniden üretmeyin; eski credential'lar okunamaz olab
 1. `.runtime/config.json` dosyasını inceleyin. Lab varsayılanı
    `http://localhost:8080`, yalnızca **127.0.0.1:8080** dinlenir. DB, Valkey,
    uWSGI host portu açılmaz; `allowed_hosts` wildcard kabul etmez.
-2. `./dojo doctor` ile bağımlılık/Compose kontrolünü yapın. En az 5 GiB boş alan
-   kontrolü bütün imaj/veri/yedekler için kapasite planının yerine geçmez.
+2. `./dojo doctor` ile bağımlılık/Compose ve gerçek Docker/veri/yedek filesystem
+   alanlarını kontrol edin. Üretimde önce [veri diski ve VM dışı mount](docs/production.md)
+   hazırlığını tamamlayın; alan eşikleri kapasite planının yerine geçmez.
 3. `./dojo install` ile sabit imajları çekip initializer/migration ve sağlık
    doğrulamasını tamamlayın. İlk başlangıç uzun sürebilir.
 4. Uzak lab erişimi için kendi bilgisayarınızda
@@ -114,7 +120,11 @@ süreci durdurulmaz. Worker active/reserved/scheduled işleri,
 broker priority list'leri ve unacknowledged teslimler boşalmadan yedek alınmaz.
 Yoğun worker inspect'e cevap veremeyebilir; süre sonuna kadar beklenir. İşler
 purge edilmez, importlar SIGKILL ile kesilmez. `drain_timeout` (900 sn varsayılan)
-dolarsa işlem hata verir, erişim kapalı kalır.
+dolarsa işlem hata verir, erişim kapalı kalır. Üretim örneği drain için 4 saat
+önerir; gerçek iş süresiyle ayarlayın. Dump/media için ayrı `backup_timeout`,
+restore için `restore_timeout` kullanılır. Toplam bakım kesintisi drain başlangıcından
+yeniden hazır olana kadar `maintenance.json` ve loga yazılır; uzak kopya ve yeniden
+aktivasyon da dahildir. Hata sonrası açık pencere retry boyunca sürer.
 
 Her yedek şunları taşır:
 
@@ -141,12 +151,16 @@ göre yoldur; varsayılan `backups/`. `retention_days: 14` başarılı yeni yede
 sonra eski günlük yedekleri temizler. En yeni günlük yedek ve **bütün upgrade
 yedekleri** korunur. Upgrade ve `.partial-*` temizliği operatöre aittir.
 
-`backup_copy_dir` önceden oluşturulmuş 0700 izinli ayrı hedefin mutlak yolu olabilir:
+`backup_copy_dir` önceden oluşturulmuş 0700 izinli ayrı hedefin mutlak yolu olabilir
+(`backup_copy_mount` ile beklenen gerçek mount da belirtilir):
 şifreli ayrı disk veya güvenli biçimde bağlanmış uzak filesystem. Kopya checksum ile
 doğrulanır; başarısızsa upgrade/retention devam etmez. Mount'u siz yönetirsiniz;
 zorunlu SSH hesabı, SaaS veya bildirim servisi yoktur. Uzak retention bağımsızdır.
 Aynı VM diski tek başına felaket kurtarma yedeği değildir; düzenli ayrı restore
-provası yapın. `command_timeout` ve disk kapasitesini gerçek yedek hacmine göre ölçün.
+provası yapın. `backup_timeout`, `restore_timeout` ve disk eşiklerini gerçek hacme göre ölçün.
+`backup_copy_mount` zorunlu beklenen mount yoludur; mount yokken yerel dizine
+başarılı kopya raporlanmaz. Üretim profili VM dışı uzak filesystem ister.
+Ayrıntılar ve eski yedeklerde alan tahmini: [üretim rehberi](docs/production.md).
 
 ## Günlük backup ve periyodik yeni sürüm kontrolü
 
@@ -158,7 +172,9 @@ ve backup başarılı olmalı. Hedef VM'de siz:
    alanlarını mevcut operatör hesabınıza uyarlayın. Aynı hesap state/backup'a erişmeli.
 2. Günlük 02:00 backup, pazartesi 09:00 kontrol saatlerini bakım pencerenize göre
    düzenleyin. Host yerel saati kullanılır; `Persistent=true` kaçırılan işi sonradan
-   çalıştırabilir. `TimeoutStartSec` toplam bakım süresinden uzun olmalı.
+   çalıştırabilir. Backup şablonunda `TimeoutStartSec=infinity` ve `TimeoutStopSec=infinity`
+   kullanılır; uzun bakım systemd tarafından kesilmez. CLI aşama sürelerini yönetin.
+   Kendi veri/yedek mount yollarınızla `RequiresMountsFor=` ekleyin.
 3. Dört dosyayı `/etc/systemd/system/` içine kopyalayın; ardından:
 
 ```sh
@@ -206,7 +222,8 @@ Onaydaki isim `config.json` içindeki `project` olmalıdır. Restore checksum, y
 manifest/sürüm, konfigürasyon, media ve PostgreSQL arşivini değişiklikten önce
 kontrol eder. Eski volume'leri silmeden **yeni volume nesline** yükler; aktif kurulum
 bu veriye geçirilir. Yedekten sonraki değişiklikler yeni aktif sistemde bulunmaz.
-Hedef VM'nin project/port/hostname/HTTPS/backup/hook ayarları korunur, uygulama sürümü
+Hedef VM'nin project/port/hostname/HTTPS/backup/hook, kaynak/upload/disk ve timeout
+ayarları korunur; uygulama sürümü
 ve secret'ları yedekten gelir. Eski metadata `.runtime/history/` içinde saklanır.
 
 Eski volume'ler disk tüketir; restore doğrulanıp retention kararı verildikten sonra
@@ -229,7 +246,7 @@ imaj arşivi/kurum registry kopyası ve host TLS yedeği ayrıca planlanmalıdı
 | Migration exit nonzero | Özel logları inceleyin; aynı hedef `start --resume` veya önceki yedeğe onaylı restore |
 | Sağlık hatası | `doctor`, DB/Valkey/worker/HTTP logları; `failed` durumda sıradan start engellenir |
 | Restore yarıda | `restoring` start'ı engeller; aynı backup ve açık onay ile restore'ı tekrar edin |
-| 413/büyük import | Proxy ve imaj nginx upload limitlerini birlikte inceleyin; eksik raporu kapatıcı reimport etmeyin |
+| 413/büyük import | [Üç katmanlı upload/timeout ayarlarını](docs/production.md) eşleştirin; `start` ardından `doctor`; eksik raporu kapatıcı reimport etmeyin |
 
 Özel loglar yalnızca yönetici terminalinde:
 
@@ -270,7 +287,7 @@ Token'ı process argümanı/history'ye koymadan 0600 izinli `/secure/dojo-curl.c
 dosyasında `header = "Authorization: Token ..."` tutun. Tek rapor örneği:
 
 ```sh
-curl --fail-with-body --silent --show-error --max-time 900 \
+curl --fail-with-body --silent --show-error --max-time 3600 \
   --config /secure/dojo-curl.conf \
   --form 'test=123' \
   --form 'scan_type=OpenVAS Parser v2' \
@@ -281,7 +298,8 @@ curl --fail-with-body --silent --show-error --max-time 900 \
 
 Kurum CA'sını istemciye ekleyin, TLS doğrulamasını kapatmayın. HTTP/JSON sonucunu
 ve Test/bulgu sayılarını doğrulayın; timeout sonrası sonucu kontrol etmeden tekrar
-göndermeyin. Aynı Test'e eşzamanlı reimport yapmayın. Bu repo tam tarama
+göndermeyin. İlk pilotta bütün importları sırayla çalıştırın. Aynı Test'e eşzamanlı
+reimport yapmayın. Bu repo tam tarama
 orkestrasyon platformu kurmaz.
 
 ## Doğrulama ve lisans

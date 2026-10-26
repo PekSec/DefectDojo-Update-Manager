@@ -12,8 +12,9 @@ WorkingDirectory=/opt/defectdojo-update-manager
 ExecStart=/opt/defectdojo-update-manager/dojo backup
 UMask=0077
 # Do not interrupt a drain, backup, or initializer with systemd's default deadline.
-TimeoutStartSec=4h
-TimeoutStopSec=60
+# Stage deadlines belong to config.json; systemd must not cut a long maintenance short.
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
 Nice=10
 StandardOutput=journal
 StandardError=journal
